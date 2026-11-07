@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/neisii/status-relay/internal/checker"
 	"github.com/neisii/status-relay/internal/engine"
+	"github.com/neisii/status-relay/internal/metrics"
 	"github.com/neisii/status-relay/internal/proxy"
 )
 
@@ -54,18 +56,23 @@ func main() {
 	}
 
 	// ── build components ──────────────────────────────────────────────────
+	m := metrics.New()
+
 	eng := engine.New(engine.Config{
 		FailThreshold:    *failN,
 		LatencyThreshold: time.Duration(*latencyMS) * time.Millisecond,
 		RecoverThreshold: *recoverN,
 	})
+	eng.SetMetrics(m)
 
 	hc := checker.New(*primaryURL, *interval, *probeTimeout)
+	hc.SetMetrics(m)
 
 	router, err := proxy.New(*primaryURL, *fallbackURL, eng)
 	if err != nil {
 		log.Fatalf("failed to create proxy router: %v", err)
 	}
+	router.SetMetrics(m)
 
 	// ── context + signal handling ─────────────────────────────────────────
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -78,10 +85,17 @@ func main() {
 	go eng.Run(ctx, hc.Results())
 
 	// ── start HTTP proxy server ───────────────────────────────────────────
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(m.Snapshot())
+	})
+	mux.Handle("/", router)
+
 	addr := fmt.Sprintf(":%d", *port)
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: router,
+		Handler: mux,
 		// Conservative timeouts — the proxy will stream whatever the
 		// upstream sends, so we keep these generous.
 		ReadTimeout:  30 * time.Second,

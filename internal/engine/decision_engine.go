@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/neisii/status-relay/internal/checker"
+	"github.com/neisii/status-relay/internal/metrics"
 )
 
 // RouteTarget identifies which upstream to use.
@@ -48,6 +49,7 @@ type DecisionEngine struct {
 	cfg        Config
 	target     atomic.Int32 // stores RouteTarget
 	consecutive int          // consecutive fail (negative) or success (positive) count
+	metrics    *metrics.Metrics
 }
 
 // New creates a DecisionEngine starting on the primary.
@@ -55,6 +57,11 @@ func New(cfg Config) *DecisionEngine {
 	d := &DecisionEngine{cfg: cfg}
 	d.target.Store(int32(Primary))
 	return d
+}
+
+// SetMetrics attaches a Metrics instance to record failover/recovery events.
+func (d *DecisionEngine) SetMetrics(m *metrics.Metrics) {
+	d.metrics = m
 }
 
 // Run consumes results until ctx is cancelled or the channel is closed.
@@ -102,14 +109,24 @@ func (d *DecisionEngine) process(r checker.CheckResult) {
 			d.target.Store(int32(Fallback))
 			log.Printf("[engine] FAILOVER → fallback  (consecutive_failures=%d, last_latency=%s, err=%v)",
 				-d.consecutive, r.Latency, r.Err)
+			if d.metrics != nil {
+				d.metrics.RecordFailover()
+			}
 			d.consecutive = 0
+		} else if d.metrics != nil {
+			d.metrics.RecordConsecutiveCount(-d.consecutive, "failures")
 		}
 	case Fallback:
 		// Return to primary after RecoverThreshold consecutive successes.
 		if d.consecutive >= d.cfg.RecoverThreshold {
 			d.target.Store(int32(Primary))
 			log.Printf("[engine] RECOVER  → primary   (consecutive_successes=%d)", d.consecutive)
+			if d.metrics != nil {
+				d.metrics.RecordRecovery()
+			}
 			d.consecutive = 0
+		} else if d.metrics != nil {
+			d.metrics.RecordConsecutiveCount(d.consecutive, "successes")
 		}
 	}
 }
