@@ -2,6 +2,7 @@
 package metrics
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -25,25 +26,22 @@ type Metrics struct {
 	lastRecoveryTime time.Time
 
 	// Request statistics (Primary)
-	primaryRequests      int
-	primarySuccessful    int
-	primaryFailed        int
-	primaryLatencies     []time.Duration // keep last 1000
-	primaryLatenciesLock sync.Mutex
+	primaryRequests   int
+	primarySuccessful int
+	primaryFailed     int
+	primaryLatencies  []time.Duration // keep last 1000
 
 	// Request statistics (Fallback)
-	fallbackRequests      int
-	fallbackSuccessful    int
-	fallbackFailed        int
-	fallbackLatencies     []time.Duration // keep last 1000
-	fallbackLatenciesLock sync.Mutex
+	fallbackRequests   int
+	fallbackSuccessful int
+	fallbackFailed     int
+	fallbackLatencies  []time.Duration // keep last 1000
 
 	// Health check statistics
-	totalProbes        int
-	successfulProbes   int
-	failedProbes       int
-	probeLatencies     []time.Duration // keep last 1000
-	probeLatenciesLock sync.Mutex
+	totalProbes      int
+	successfulProbes int
+	failedProbes     int
+	probeLatencies   []time.Duration // keep last 1000
 }
 
 const maxLatencySamples = 1000
@@ -108,14 +106,11 @@ func (m *Metrics) recordPrimaryRequest(success bool, latency time.Duration) {
 	} else {
 		m.primaryFailed++
 	}
-	m.mu.Unlock()
-
-	m.primaryLatenciesLock.Lock()
 	m.primaryLatencies = append(m.primaryLatencies, latency)
 	if len(m.primaryLatencies) > maxLatencySamples {
 		m.primaryLatencies = m.primaryLatencies[1:]
 	}
-	m.primaryLatenciesLock.Unlock()
+	m.mu.Unlock()
 }
 
 func (m *Metrics) recordFallbackRequest(success bool, latency time.Duration) {
@@ -126,14 +121,11 @@ func (m *Metrics) recordFallbackRequest(success bool, latency time.Duration) {
 	} else {
 		m.fallbackFailed++
 	}
-	m.mu.Unlock()
-
-	m.fallbackLatenciesLock.Lock()
 	m.fallbackLatencies = append(m.fallbackLatencies, latency)
 	if len(m.fallbackLatencies) > maxLatencySamples {
 		m.fallbackLatencies = m.fallbackLatencies[1:]
 	}
-	m.fallbackLatenciesLock.Unlock()
+	m.mu.Unlock()
 }
 
 // RecordProbe records a health check probe result.
@@ -145,14 +137,11 @@ func (m *Metrics) RecordProbe(success bool, latency time.Duration) {
 	} else {
 		m.failedProbes++
 	}
-	m.mu.Unlock()
-
-	m.probeLatenciesLock.Lock()
 	m.probeLatencies = append(m.probeLatencies, latency)
 	if len(m.probeLatencies) > maxLatencySamples {
 		m.probeLatencies = m.probeLatencies[1:]
 	}
-	m.probeLatenciesLock.Unlock()
+	m.mu.Unlock()
 }
 
 // Snapshot returns a JSON-ready snapshot of current metrics.
@@ -271,11 +260,8 @@ func (m *Metrics) average(latencies []time.Duration) float64 {
 }
 
 func round(f float64, decimals int) float64 {
-	mult := 1.0
-	for i := 0; i < decimals; i++ {
-		mult *= 10
-	}
-	return float64(int64(f*mult)) / mult
+	mult := math.Pow10(decimals)
+	return math.Round(f*mult) / mult
 }
 
 func timePtr(t time.Time) interface{} {
