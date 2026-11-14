@@ -46,10 +46,10 @@ type Config struct {
 
 // DecisionEngine reads CheckResults and updates the atomic routing target.
 type DecisionEngine struct {
-	cfg        Config
-	target     atomic.Int32 // stores RouteTarget
+	cfg         Config
+	target      atomic.Int32 // stores RouteTarget
 	consecutive int          // consecutive fail (negative) or success (positive) count
-	metrics    *metrics.Metrics
+	metrics     *metrics.Metrics
 }
 
 // New creates a DecisionEngine starting on the primary.

@@ -14,15 +14,15 @@ type Metrics struct {
 	startTime time.Time
 
 	// Current routing state
-	activeTarget          string // "primary" or "fallback"
-	consecutiveCount      int
-	consecutiveType       string // "successes" or "failures"
+	activeTarget     string // "primary" or "fallback"
+	consecutiveCount int
+	consecutiveType  string // "successes" or "failures"
 
 	// Failover events
-	totalFailovers      int
-	totalRecoveries     int
-	lastFailoverTime    time.Time
-	lastRecoveryTime    time.Time
+	totalFailovers   int
+	totalRecoveries  int
+	lastFailoverTime time.Time
+	lastRecoveryTime time.Time
 
 	// Request statistics (Primary)
 	primaryRequests      int
@@ -32,18 +32,18 @@ type Metrics struct {
 	primaryLatenciesLock sync.Mutex
 
 	// Request statistics (Fallback)
-	fallbackRequests     int
-	fallbackSuccessful   int
-	fallbackFailed       int
-	fallbackLatencies    []time.Duration // keep last 1000
+	fallbackRequests      int
+	fallbackSuccessful    int
+	fallbackFailed        int
+	fallbackLatencies     []time.Duration // keep last 1000
 	fallbackLatenciesLock sync.Mutex
 
 	// Health check statistics
-	totalProbes         int
-	successfulProbes    int
-	failedProbes        int
-	probeLatencies      []time.Duration // keep last 1000
-	probeLatenciesLock  sync.Mutex
+	totalProbes        int
+	successfulProbes   int
+	failedProbes       int
+	probeLatencies     []time.Duration // keep last 1000
+	probeLatenciesLock sync.Mutex
 }
 
 const maxLatencySamples = 1000
@@ -51,8 +51,8 @@ const maxLatencySamples = 1000
 // New creates a new Metrics instance.
 func New() *Metrics {
 	return &Metrics{
-		startTime:      time.Now(),
-		activeTarget:   "primary",
+		startTime:       time.Now(),
+		activeTarget:    "primary",
 		consecutiveType: "successes",
 	}
 }
@@ -187,45 +187,45 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"version":   "1.0",
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"version":        "1.0",
+		"timestamp":      time.Now().UTC().Format(time.RFC3339),
 		"uptime_seconds": uptime,
 		"current_state": map[string]interface{}{
-			"active_target":    m.activeTarget,
+			"active_target":     m.activeTarget,
 			"consecutive_count": m.consecutiveCount,
-			"consecutive_type": m.consecutiveType,
+			"consecutive_type":  m.consecutiveType,
 		},
 		"failover_events": map[string]interface{}{
-			"total_failovers":   m.totalFailovers,
-			"total_recoveries":  m.totalRecoveries,
-			"last_failover_at":  timePtr(m.lastFailoverTime),
-			"last_recovery_at":  timePtr(m.lastRecoveryTime),
+			"total_failovers":  m.totalFailovers,
+			"total_recoveries": m.totalRecoveries,
+			"last_failover_at": timePtr(m.lastFailoverTime),
+			"last_recovery_at": timePtr(m.lastRecoveryTime),
 		},
 		"request_stats": map[string]interface{}{
 			"primary": map[string]interface{}{
-				"total_requests":     m.primaryRequests,
+				"total_requests":      m.primaryRequests,
 				"successful_requests": m.primarySuccessful,
-				"failed_requests":    m.primaryFailed,
-				"avg_latency_ms":     primaryAvg,
-				"p95_latency_ms":     primaryP95,
-				"p99_latency_ms":     primaryP99,
-				"error_rate":         round(primaryErrorRate, 4),
+				"failed_requests":     m.primaryFailed,
+				"avg_latency_ms":      primaryAvg,
+				"p95_latency_ms":      primaryP95,
+				"p99_latency_ms":      primaryP99,
+				"error_rate":          round(primaryErrorRate, 4),
 			},
 			"fallback": map[string]interface{}{
-				"total_requests":     m.fallbackRequests,
+				"total_requests":      m.fallbackRequests,
 				"successful_requests": m.fallbackSuccessful,
-				"failed_requests":    m.fallbackFailed,
-				"avg_latency_ms":     fallbackAvg,
-				"p95_latency_ms":     fallbackP95,
-				"p99_latency_ms":     fallbackP99,
-				"error_rate":         round(fallbackErrorRate, 4),
+				"failed_requests":     m.fallbackFailed,
+				"avg_latency_ms":      fallbackAvg,
+				"p95_latency_ms":      fallbackP95,
+				"p99_latency_ms":      fallbackP99,
+				"error_rate":          round(fallbackErrorRate, 4),
 			},
 		},
 		"health_check_stats": map[string]interface{}{
-			"total_probes":       m.totalProbes,
-			"successful_probes":  m.successfulProbes,
-			"failed_probes":      m.failedProbes,
-			"success_rate":       round(probeSuccessRate, 4),
+			"total_probes":         m.totalProbes,
+			"successful_probes":    m.successfulProbes,
+			"failed_probes":        m.failedProbes,
+			"success_rate":         round(probeSuccessRate, 4),
 			"avg_probe_latency_ms": probeAvg,
 			"p95_probe_latency_ms": probeP95,
 			"p99_probe_latency_ms": probeP99,

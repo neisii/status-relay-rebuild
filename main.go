@@ -36,14 +36,14 @@ func main() {
 	// ── flags ─────────────────────────────────────────────────────────────
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 
-	primaryURL  := fs.String("primary",            "", "Primary upstream URL (required)")
-	fallbackURL := fs.String("fallback",            "", "Fallback upstream URL (required)")
-	port        := fs.Int("port",                8080, "Local port to listen on")
-	interval    := fs.Duration("interval",      200*time.Millisecond, "Health-check interval")
+	primaryURL := fs.String("primary", "", "Primary upstream URL (required)")
+	fallbackURL := fs.String("fallback", "", "Fallback upstream URL (required)")
+	port := fs.Int("port", 8080, "Local port to listen on")
+	interval := fs.Duration("interval", 200*time.Millisecond, "Health-check interval")
 	probeTimeout := fs.Duration("probe-timeout", 1500*time.Millisecond, "Per-probe HTTP timeout")
-	failN       := fs.Int("fail-threshold",         3, "Consecutive failures before failover")
-	latencyMS   := fs.Int("latency-threshold",   1000, "Latency (ms) that counts as a failure")
-	recoverN    := fs.Int("recover-threshold",      2, "Consecutive successes before recovering primary")
+	failN := fs.Int("fail-threshold", 3, "Consecutive failures before failover")
+	latencyMS := fs.Int("latency-threshold", 1000, "Latency (ms) that counts as a failure")
+	recoverN := fs.Int("recover-threshold", 2, "Consecutive successes before recovering primary")
 
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		os.Exit(1)

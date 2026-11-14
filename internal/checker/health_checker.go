@@ -14,9 +14,9 @@ import (
 // CheckResult is the outcome of a single health probe.
 type CheckResult struct {
 	Timestamp  time.Time
-	StatusCode int           // 0 if the request never completed
+	StatusCode int // 0 if the request never completed
 	Latency    time.Duration
-	Err        error         // non-nil on timeout or network error
+	Err        error // non-nil on timeout or network error
 }
 
 // HealthChecker probes a URL at a regular interval.
