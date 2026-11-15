@@ -7,14 +7,16 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/neisii/status-relay/internal/metrics"
 )
 
 // CheckResult is the outcome of a single health probe.
 type CheckResult struct {
 	Timestamp  time.Time
-	StatusCode int           // 0 if the request never completed
+	StatusCode int // 0 if the request never completed
 	Latency    time.Duration
-	Err        error         // non-nil on timeout or network error
+	Err        error // non-nil on timeout or network error
 }
 
 // HealthChecker probes a URL at a regular interval.
@@ -24,6 +26,7 @@ type HealthChecker struct {
 	timeout  time.Duration
 	client   *http.Client
 	results  chan CheckResult
+	metrics  *metrics.Metrics
 }
 
 // New creates a HealthChecker.
@@ -61,6 +64,11 @@ func (h *HealthChecker) Results() <-chan CheckResult {
 	return h.results
 }
 
+// SetMetrics attaches a Metrics instance to record probe results.
+func (h *HealthChecker) SetMetrics(m *metrics.Metrics) {
+	h.metrics = m
+}
+
 func (h *HealthChecker) loop(ctx context.Context) {
 	ticker := time.NewTicker(h.interval)
 	defer ticker.Stop()
@@ -71,7 +79,14 @@ func (h *HealthChecker) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case t := <-ticker.C:
-			h.results <- h.probe(t)
+			result := h.probe(t)
+			h.results <- result
+
+			// Record probe result to metrics
+			if h.metrics != nil {
+				success := result.Err == nil && result.StatusCode >= 200 && result.StatusCode < 500
+				h.metrics.RecordProbe(success, result.Latency)
+			}
 		}
 	}
 }

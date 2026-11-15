@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 
 	"github.com/neisii/status-relay/internal/engine"
+	"github.com/neisii/status-relay/internal/metrics"
 )
 
 // Router is an http.Handler that forwards requests to the active upstream.
@@ -19,6 +21,7 @@ type Router struct {
 	primaryProxy  *httputil.ReverseProxy
 	fallbackProxy *httputil.ReverseProxy
 	engine        *engine.DecisionEngine
+	metrics       *metrics.Metrics
 }
 
 // New creates a Router.  primaryURL and fallbackURL must be valid absolute URLs.
@@ -39,18 +42,48 @@ func New(primaryURL, fallbackURL string, eng *engine.DecisionEngine) (*Router, e
 	}, nil
 }
 
+// SetMetrics attaches a Metrics instance to record request statistics.
+func (r *Router) SetMetrics(m *metrics.Metrics) {
+	r.metrics = m
+}
+
 // ServeHTTP satisfies http.Handler.  It reads the current routing target
 // (one atomic load) and dispatches to the appropriate reverse proxy.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	target := r.engine.Target()
+	start := time.Now()
+
+	// Wrap ResponseWriter to capture status code
+	wrapped := &statusCodeCapture{ResponseWriter: w, statusCode: http.StatusOK}
 
 	switch target {
 	case engine.Primary:
-		r.primaryProxy.ServeHTTP(w, req)
+		r.primaryProxy.ServeHTTP(wrapped, req)
+		if r.metrics != nil {
+			latency := time.Since(start)
+			success := wrapped.statusCode >= 200 && wrapped.statusCode < 500
+			r.metrics.RecordRequest("primary", success, latency)
+		}
 	case engine.Fallback:
 		log.Printf("[proxy] routing to FALLBACK  path=%s", req.URL.Path)
-		r.fallbackProxy.ServeHTTP(w, req)
+		r.fallbackProxy.ServeHTTP(wrapped, req)
+		if r.metrics != nil {
+			latency := time.Since(start)
+			success := wrapped.statusCode >= 200 && wrapped.statusCode < 500
+			r.metrics.RecordRequest("fallback", success, latency)
+		}
 	}
+}
+
+// statusCodeCapture wraps ResponseWriter to capture the HTTP status code.
+type statusCodeCapture struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (s *statusCodeCapture) WriteHeader(code int) {
+	s.statusCode = code
+	s.ResponseWriter.WriteHeader(code)
 }
 
 // newReverseProxy builds a standard reverse proxy for the given base URL,
