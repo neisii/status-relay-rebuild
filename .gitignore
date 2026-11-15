@@ -1,0 +1,5 @@
+# build output
+/status-relay
+
+# Claude Code local settings
+.claude/
