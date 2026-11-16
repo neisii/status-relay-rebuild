@@ -185,3 +185,42 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+func currentState(t *testing.T, m *metrics.Metrics) (int, string) {
+	t.Helper()
+	st := m.Snapshot()["current_state"].(map[string]interface{})
+	return st["consecutive_count"].(int), st["consecutive_type"].(string)
+}
+
+func TestConsecutiveCountDirection(t *testing.T) {
+	tests := []struct {
+		name      string
+		prefix    []checker.CheckResult // 대상 전환용 선행 입력
+		inputs    []checker.CheckResult
+		wantCount int
+		wantType  string
+	}{
+		{"primary 성공 1회", nil, []checker.CheckResult{ok()}, 1, "successes"},
+		{"primary 성공 2회", nil, []checker.CheckResult{ok(), ok()}, 2, "successes"},
+		{"primary 실패 1회", nil, []checker.CheckResult{bad()}, 1, "failures"},
+		{"primary 실패 2회", nil, []checker.CheckResult{bad(), bad()}, 2, "failures"},
+		{"primary 실패 뒤 성공", nil, []checker.CheckResult{bad(), bad(), ok()}, 1, "successes"},
+		{"fallback 실패 1회", []checker.CheckResult{bad(), bad(), bad()}, []checker.CheckResult{bad()}, 1, "failures"},
+		{"fallback 실패 2회", []checker.CheckResult{bad(), bad(), bad()}, []checker.CheckResult{bad(), bad()}, 2, "failures"},
+		{"fallback 성공 1회", []checker.CheckResult{bad(), bad(), bad()}, []checker.CheckResult{ok()}, 1, "successes"},
+		{"fallback 성공 뒤 실패", []checker.CheckResult{bad(), bad(), bad()}, []checker.CheckResult{ok(), bad()}, 1, "failures"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := metrics.New()
+			d := New(Config{FailThreshold: 3, LatencyThreshold: 100 * time.Millisecond, RecoverThreshold: 3})
+			d.SetMetrics(m)
+			feed(d, tt.prefix...)
+			feed(d, tt.inputs...)
+			gotCount, gotType := currentState(t, m)
+			if gotCount != tt.wantCount || gotType != tt.wantType {
+				t.Errorf("consecutive = (%d, %q), want (%d, %q)", gotCount, gotType, tt.wantCount, tt.wantType)
+			}
+		})
+	}
+}
