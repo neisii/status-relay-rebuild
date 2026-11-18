@@ -113,8 +113,8 @@ func (d *DecisionEngine) process(r checker.CheckResult) {
 				d.metrics.RecordFailover()
 			}
 			d.consecutive = 0
-		} else if d.metrics != nil {
-			d.metrics.RecordConsecutiveCount(-d.consecutive, "failures")
+		} else {
+			d.recordStreak()
 		}
 	case Fallback:
 		// Return to primary after RecoverThreshold consecutive successes.
@@ -125,10 +125,24 @@ func (d *DecisionEngine) process(r checker.CheckResult) {
 				d.metrics.RecordRecovery()
 			}
 			d.consecutive = 0
-		} else if d.metrics != nil {
-			d.metrics.RecordConsecutiveCount(d.consecutive, "successes")
+		} else {
+			d.recordStreak()
 		}
 	}
+}
+
+// recordStreak reports the current streak to metrics. The count is the streak
+// length (always non-negative) and the type follows the streak direction,
+// regardless of which upstream is currently active.
+func (d *DecisionEngine) recordStreak() {
+	if d.metrics == nil {
+		return
+	}
+	if d.consecutive < 0 {
+		d.metrics.RecordConsecutiveCount(-d.consecutive, "failures")
+		return
+	}
+	d.metrics.RecordConsecutiveCount(d.consecutive, "successes")
 }
 
 // isFailed returns true if this result counts as a failure.
