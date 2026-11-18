@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -179,7 +180,151 @@ func TestParseConfigHelp(t *testing.T) {
 	}
 }
 
+// ── parseConfig: value validation ────────────────────────────────────────
+
+var validBase = []string{"--primary", "http://p", "--fallback", "http://f"}
+
+func withArgs(extra ...string) []string {
+	return append(append([]string{}, validBase...), extra...)
+}
+
+func TestParseConfigAcceptsBoundaryValues(t *testing.T) {
+	cases := map[string][]string{
+		"port min":                withArgs("--port", "0"),
+		"port max":                withArgs("--port", "65535"),
+		"interval min":            withArgs("--interval", "10ms"),
+		"probe-timeout min":       withArgs("--probe-timeout", "10ms"),
+		"fail-threshold min":      withArgs("--fail-threshold", "1"),
+		"recover-threshold min":   withArgs("--recover-threshold", "1"),
+		"latency-threshold min":   withArgs("--latency-threshold", "1"),
+		"latency-threshold max":   withArgs("--latency-threshold", "9223372036854"),
+		"same primary / fallback": {"--primary", "http://p", "--fallback", "http://p"},
+		"https with port, path":   {"--primary", "https://h:8443/base", "--fallback", "http://f"},
+		"upper-case scheme":       {"--primary", "HTTP://H", "--fallback", "http://f"},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if _, err := parseConfig(args, &buf); err != nil {
+				t.Fatalf("unexpected error: %v (output=%q)", err, buf.String())
+			}
+		})
+	}
+}
+
+func TestParseConfigRejectsOutOfRangeValues(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		flag string
+	}{
+		{"port negative", withArgs("--port", "-1"), "--port"},
+		{"port too large", withArgs("--port", "65536"), "--port"},
+		{"interval zero", withArgs("--interval", "0"), "--interval"},
+		{"interval negative", withArgs("--interval", "-1s"), "--interval"},
+		{"interval below min", withArgs("--interval", "9ms"), "--interval"},
+		{"probe-timeout zero", withArgs("--probe-timeout", "0"), "--probe-timeout"},
+		{"probe-timeout negative", withArgs("--probe-timeout", "-1s"), "--probe-timeout"},
+		{"probe-timeout below min", withArgs("--probe-timeout", "9ms"), "--probe-timeout"},
+		{"fail-threshold zero", withArgs("--fail-threshold", "0"), "--fail-threshold"},
+		{"fail-threshold negative", withArgs("--fail-threshold", "-3"), "--fail-threshold"},
+		{"recover-threshold zero", withArgs("--recover-threshold", "0"), "--recover-threshold"},
+		{"recover-threshold negative", withArgs("--recover-threshold", "-1"), "--recover-threshold"},
+		{"latency-threshold zero", withArgs("--latency-threshold", "0"), "--latency-threshold"},
+		{"latency-threshold negative", withArgs("--latency-threshold", "-5"), "--latency-threshold"},
+		{"latency-threshold overflow edge", withArgs("--latency-threshold", "9223372036855"), "--latency-threshold"},
+		{"latency-threshold int64 max", withArgs("--latency-threshold", "9223372036854775807"), "--latency-threshold"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, err := parseConfig(tc.args, &buf)
+			if !errors.Is(err, errInvalidConfig) {
+				t.Fatalf("err = %v, want errInvalidConfig", err)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "Error: invalid "+tc.flag+" ") {
+				t.Errorf("output lacks error for %s: %q", tc.flag, out)
+			}
+			if !strings.Contains(out, "Usage of start:") {
+				t.Errorf("output lacks usage: %q", out)
+			}
+		})
+	}
+}
+
+func TestParseConfigRejectsInvalidURLs(t *testing.T) {
+	bad := []string{" ", " http://p", "not-a-url", "localhost:9000", "ftp://x", "http://", "::bad", "http://a b"}
+	for _, u := range bad {
+		for _, name := range []string{"primary", "fallback"} {
+			t.Run(fmt.Sprintf("%s=%q", name, u), func(t *testing.T) {
+				args := []string{"--primary", "http://p", "--fallback", "http://f"}
+				if name == "primary" {
+					args[1] = u
+				} else {
+					args[3] = u
+				}
+				var buf bytes.Buffer
+				_, err := parseConfig(args, &buf)
+				if !errors.Is(err, errInvalidConfig) {
+					t.Fatalf("err = %v, want errInvalidConfig", err)
+				}
+				if !strings.Contains(buf.String(), "Error: invalid --"+name+" ") {
+					t.Errorf("output = %q", buf.String())
+				}
+			})
+		}
+	}
+}
+
+func TestParseConfigReportsAllErrors(t *testing.T) {
+	var buf bytes.Buffer
+	_, err := parseConfig([]string{
+		"--primary", "ftp://x", "--fallback", "http://f",
+		"--interval", "0", "--fail-threshold", "0",
+	}, &buf)
+	if !errors.Is(err, errInvalidConfig) {
+		t.Fatalf("err = %v, want errInvalidConfig", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"invalid --primary", "invalid --interval", "invalid --fail-threshold"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q: %q", want, out)
+		}
+	}
+}
+
+func TestParseConfigRejectsPositionalArgs(t *testing.T) {
+	cases := map[string][]string{
+		"after flags":  withArgs("extra-arg"),
+		"before flags": append([]string{"extra-arg"}, validBase...),
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, err := parseConfig(args, &buf)
+			if !errors.Is(err, errInvalidConfig) {
+				t.Fatalf("err = %v, want errInvalidConfig", err)
+			}
+			if !strings.Contains(buf.String(), `unexpected argument "extra-arg"`) {
+				t.Errorf("output = %q", buf.String())
+			}
+		})
+	}
+}
+
 // ── run: exit codes ──────────────────────────────────────────────────────
+
+func TestRunInvalidConfigMessage(t *testing.T) {
+	var buf bytes.Buffer
+	got := run(context.Background(), []string{"start", "--primary", "http://p", "--fallback", "http://f", "--interval", "0"}, &buf)
+	if got != 2 {
+		t.Errorf("exit = %d, want 2", got)
+	}
+	if !strings.Contains(buf.String(), "Error: invalid --interval 0s: must be at least 10ms") {
+		t.Errorf("stderr = %q", buf.String())
+	}
+}
 
 func TestRunExitCodes(t *testing.T) {
 	quietLog(t)
@@ -195,7 +340,15 @@ func TestRunExitCodes(t *testing.T) {
 		{"unknown flag", []string{"start", "--bogus"}, 2},
 		{"invalid flag value", []string{"start", "--port", "abc"}, 2},
 		{"help", []string{"start", "-h"}, 0},
-		{"invalid URL", []string{"start", "--primary", "::bad", "--fallback", "http://f"}, 1},
+		// Invalid values are rejected before anything starts (exit 2, same as a
+		// flag parse error). "invalid URL" and the port range used to exit 1.
+		{"invalid URL", []string{"start", "--primary", "::bad", "--fallback", "http://f"}, 2},
+		{"URL without scheme", []string{"start", "--primary", "localhost:9000", "--fallback", "http://f"}, 2},
+		{"port out of range", []string{"start", "--primary", "http://p", "--fallback", "http://f", "--port", "65536"}, 2},
+		{"interval zero", []string{"start", "--primary", "http://p", "--fallback", "http://f", "--interval", "0"}, 2},
+		{"probe-timeout zero", []string{"start", "--primary", "http://p", "--fallback", "http://f", "--probe-timeout", "0"}, 2},
+		{"fail-threshold zero", []string{"start", "--primary", "http://p", "--fallback", "http://f", "--fail-threshold", "0"}, 2},
+		{"unexpected positional argument", []string{"start", "--primary", "http://p", "--fallback", "http://f", "extra"}, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
