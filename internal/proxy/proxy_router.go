@@ -86,6 +86,13 @@ func (s *statusCodeCapture) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap exposes the underlying ResponseWriter so http.ResponseController
+// (used by httputil.ReverseProxy) can reach Flush, Hijack and friends.
+// Without it, SSE responses are not flushed and Upgrade requests fail.
+func (s *statusCodeCapture) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 // newReverseProxy builds a standard reverse proxy for the given base URL,
 // rewriting the Host header so the upstream receives a proper request.
 func newReverseProxy(base *url.URL) *httputil.ReverseProxy {
