@@ -16,10 +16,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +48,22 @@ type config struct {
 // is not given.  run maps it to exit code 1.
 var errMissingRequired = errors.New("--primary and --fallback are required")
 
+// errInvalidConfig is returned by parseConfig when a flag value is out of its
+// allowed range or malformed.  The per-flag messages are already printed to
+// stderr; run maps it to exit code 2 (same as a flag parse error).
+var errInvalidConfig = errors.New("invalid configuration")
+
+// Lower and upper bounds for flag values.  Defaults are well inside them.
+const (
+	minInterval     = 10 * time.Millisecond // default 200ms
+	minProbeTimeout = 10 * time.Millisecond // default 1500ms
+	maxPort         = 65535
+
+	// maxLatencyThresholdMS keeps time.Duration(ms) * time.Millisecond from
+	// overflowing int64.
+	maxLatencyThresholdMS = math.MaxInt64 / int64(time.Millisecond)
+)
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:], os.Stderr)
@@ -68,6 +87,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		return 0
 	case errors.Is(err, errMissingRequired):
 		return 1
+	case errors.Is(err, errInvalidConfig):
+		return 2
 	default: // flag parse error (flag.ExitOnError used to exit 2)
 		return 2
 	}
@@ -98,7 +119,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 
 // parseConfig parses the flags of the start sub-command (args excludes "start").
 // Flag errors are returned as-is (flag.ErrHelp for -h); a missing required
-// flag returns errMissingRequired after printing the message and usage.
+// flag returns errMissingRequired after printing the message and usage.  Values
+// that parse but are out of range or malformed return errInvalidConfig after
+// printing one "Error:" line per problem and the usage.
 func parseConfig(args []string, stderr io.Writer) (config, error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -117,12 +140,69 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 		return config{}, err
 	}
 
-	if cfg.primaryURL == "" || cfg.fallbackURL == "" {
+	// A positional argument stops flag parsing, so flags after it would be
+	// dropped silently.  Report it instead of a misleading "required" error.
+	var posErr error
+	if fs.NArg() > 0 {
+		posErr = fmt.Errorf("unexpected argument %q: put all flags before positional arguments", fs.Arg(0))
+	}
+
+	if posErr == nil && (cfg.primaryURL == "" || cfg.fallbackURL == "") {
 		fmt.Fprintln(stderr, "Error: --primary and --fallback are required")
 		fs.Usage()
 		return config{}, errMissingRequired
 	}
+
+	if err := errors.Join(posErr, validateConfig(cfg)); err != nil {
+		for _, line := range strings.Split(err.Error(), "\n") {
+			fmt.Fprintf(stderr, "Error: %s\n", line)
+		}
+		fs.Usage()
+		return config{}, errInvalidConfig
+	}
 	return cfg, nil
+}
+
+// validateConfig checks flag values and returns all problems joined together
+// (nil if none).  Empty URLs are skipped; parseConfig reports those as missing.
+func validateConfig(cfg config) error {
+	var errs []error
+	add := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+
+	if cfg.port < 0 || cfg.port > maxPort {
+		add("invalid --port %d: must be between 0 and %d", cfg.port, maxPort)
+	}
+	if cfg.interval < minInterval {
+		add("invalid --interval %s: must be at least %s", cfg.interval, minInterval)
+	}
+	if cfg.probeTimeout < minProbeTimeout {
+		add("invalid --probe-timeout %s: must be at least %s", cfg.probeTimeout, minProbeTimeout)
+	}
+	if cfg.failThreshold < 1 {
+		add("invalid --fail-threshold %d: must be at least 1", cfg.failThreshold)
+	}
+	if cfg.recoverThreshold < 1 {
+		add("invalid --recover-threshold %d: must be at least 1", cfg.recoverThreshold)
+	}
+	if cfg.latencyThreshold < 1 || int64(cfg.latencyThreshold) > maxLatencyThresholdMS {
+		add("invalid --latency-threshold %d: must be between 1 and %d (milliseconds)",
+			cfg.latencyThreshold, maxLatencyThresholdMS)
+	}
+	for _, u := range []struct{ flag, val string }{{"primary", cfg.primaryURL}, {"fallback", cfg.fallbackURL}} {
+		if u.val != "" && !isHTTPURL(u.val) {
+			add("invalid --%s %q: must be an http or https URL with a host", u.flag, u.val)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// isHTTPURL reports whether raw is an absolute http or https URL with a host.
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != ""
 }
 
 // app bundles the wired components.
