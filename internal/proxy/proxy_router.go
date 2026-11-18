@@ -6,7 +6,10 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"log"
+	"mime"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -55,6 +58,11 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Wrap ResponseWriter to capture status code
 	wrapped := &statusCodeCapture{ResponseWriter: w, statusCode: http.StatusOK}
+
+	// ModifyResponse only sees the *http.Response; hand it the controller of
+	// this request's writer through the context (see releaseWriteDeadlineForSSE).
+	rc := http.NewResponseController(wrapped)
+	req = req.WithContext(context.WithValue(req.Context(), responseControllerKey{}, rc))
 
 	switch target {
 	case engine.Primary:
@@ -105,6 +113,8 @@ func newReverseProxy(base *url.URL) *httputil.ReverseProxy {
 		req.Host = base.Host // make sure Host matches the upstream
 	}
 
+	proxy.ModifyResponse = releaseWriteDeadlineForSSE
+
 	// Log upstream errors without crashing the proxy.
 	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("[proxy] upstream error host=%s path=%s err=%v", base.Host, req.URL.Path, err)
@@ -112,4 +122,37 @@ func newReverseProxy(base *url.URL) *httputil.ReverseProxy {
 	}
 
 	return proxy
+}
+
+// responseControllerKey is the request-context key under which Router.ServeHTTP
+// stores the *http.ResponseController of the client-facing writer.
+type responseControllerKey struct{}
+
+// releaseWriteDeadlineForSSE lifts http.Server.WriteTimeout for a response whose
+// Content-Type is text/event-stream.  WriteTimeout is an absolute limit counted
+// from the request header, so it would cut any stream longer than that even
+// while events keep flowing.  Other responses keep the limit.
+//
+// It never fails the response: without a controller in the context (a proxy
+// used outside Router) or with a writer that cannot set deadlines, the
+// response is left as it is.
+func releaseWriteDeadlineForSSE(resp *http.Response) error {
+	if resp.Request == nil || !isEventStream(resp.Header.Get("Content-Type")) {
+		return nil
+	}
+	rc, ok := resp.Request.Context().Value(responseControllerKey{}).(*http.ResponseController)
+	if !ok {
+		return nil
+	}
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		log.Printf("[proxy] cannot lift write deadline for SSE path=%s err=%v", resp.Request.URL.Path, err)
+	}
+	return nil
+}
+
+// isEventStream reports whether a Content-Type header value is text/event-stream,
+// ignoring case and parameters such as charset.
+func isEventStream(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && mediaType == "text/event-stream"
 }

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -328,4 +329,246 @@ func TestStatusCodeCaptureExposesUnderlyingWriter(t *testing.T) {
 	if _, _, err := http.NewResponseController(s).Hijack(); !errors.Is(err, http.ErrNotSupported) {
 		t.Errorf("Hijack on non-Hijacker = %v, want http.ErrNotSupported", err)
 	}
+}
+
+// testWriteTimeout stands in for the 30s WriteTimeout of main.serve; the
+// streams below last well beyond it.
+const testWriteTimeout = 300 * time.Millisecond
+
+// timeoutServer starts h behind an http.Server with a short WriteTimeout.
+func timeoutServer(h http.Handler) *httptest.Server {
+	srv := httptest.NewUnstartedServer(h)
+	srv.Config.WriteTimeout = testWriteTimeout
+	srv.Start()
+	return srv
+}
+
+// tickUpstream sends n events, flushing each one, with interval between them.
+func tickUpstream(contentType string, n int, interval time.Duration) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		f := w.(http.Flusher)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				select {
+				case <-time.After(interval):
+				case <-r.Context().Done():
+					return
+				}
+			}
+			fmt.Fprintf(w, "data: %d\n\n", i)
+			f.Flush()
+		}
+	}))
+}
+
+// readEvents GETs url and returns how many data lines arrived and the error
+// that ended the read (io.EOF on a clean end).  No Accept header is sent.
+func readEvents(url string) (int, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	n := 0
+	for {
+		line, err := br.ReadString('\n')
+		if strings.HasPrefix(line, "data:") {
+			n++
+		}
+		if err != nil {
+			return n, err
+		}
+	}
+}
+
+// 8 events 100ms apart last about 700ms, more than twice testWriteTimeout.
+const (
+	streamEvents   = 8
+	streamInterval = 100 * time.Millisecond
+)
+
+func TestSSEOutlivesWriteTimeout(t *testing.T) {
+	for _, ct := range []string{"text/event-stream", "Text/Event-Stream; charset=utf-8"} {
+		for _, fallback := range []bool{false, true} {
+			name := fmt.Sprintf("%s/fallback=%v", ct, fallback)
+			t.Run(name, func(t *testing.T) {
+				up := tickUpstream(ct, streamEvents, streamInterval)
+				defer up.Close()
+				r, _ := newRouterFor(t, up.URL, up.URL, fallback)
+				srv := timeoutServer(r)
+				defer srv.Close()
+
+				n, err := readEvents(srv.URL)
+				if n != streamEvents || err != io.EOF {
+					t.Errorf("got %d/%d events, end error = %v; want a complete stream", n, streamEvents, err)
+				}
+			})
+		}
+	}
+}
+
+// The release is limited to SSE: any other streamed response is still cut by
+// WriteTimeout.  This pins the boundary that the blueprint documents as a
+// known limitation.
+func TestNonSSEStreamStillHitsWriteTimeout(t *testing.T) {
+	up := tickUpstream("text/plain", streamEvents, streamInterval)
+	defer up.Close()
+	r, _ := newRouterFor(t, up.URL, up.URL, false)
+	srv := timeoutServer(r)
+	defer srv.Close()
+
+	n, err := readEvents(srv.URL)
+	if err == io.EOF && n == streamEvents {
+		t.Errorf("non-SSE stream survived WriteTimeout (%d events)", n)
+	}
+}
+
+func TestSSEStreamRecordedAsSuccess(t *testing.T) {
+	up := tickUpstream("text/event-stream", streamEvents, streamInterval)
+	defer up.Close()
+	r, m := newRouterFor(t, up.URL, up.URL, false)
+	srv := timeoutServer(r)
+	defer srv.Close()
+
+	if n, err := readEvents(srv.URL); n != streamEvents || err != io.EOF {
+		t.Fatalf("got %d events, err = %v", n, err)
+	}
+	// The final chunk is written after ServeHTTP returns, so the request is
+	// already recorded when the client sees EOF.  The latency is the whole
+	// session (known limitation).
+	st := m.Snapshot()["request_stats"].(map[string]interface{})["primary"].(map[string]interface{})
+	if st["total_requests"] != 1 || st["successful_requests"] != 1 || st["failed_requests"] != 0 {
+		t.Errorf("primary stats = %v", st)
+	}
+}
+
+// ReverseProxy used outside Router has no ResponseController in the request
+// context; ModifyResponse must leave the response alone instead of failing.
+func TestSSEWithoutRouterContext(t *testing.T) {
+	up := tickUpstream("text/event-stream", 2, time.Millisecond)
+	defer up.Close()
+	base, _ := url.Parse(up.URL)
+	srv := httptest.NewServer(newReverseProxy(base))
+	defer srv.Close()
+
+	if n, err := readEvents(srv.URL); n != 2 || err != io.EOF {
+		t.Errorf("got %d events, err = %v", n, err)
+	}
+}
+
+// deadlineErrWriter refuses SetWriteDeadline with an error other than
+// http.ErrNotSupported.
+type deadlineErrWriter struct{ *httptest.ResponseRecorder }
+
+func (deadlineErrWriter) SetWriteDeadline(time.Time) error { return errors.New("deadline refused") }
+
+// A writer that cannot release the deadline (recorder: ErrNotSupported, or a
+// failing SetWriteDeadline) must not break the response.
+func TestSSEWhenDeadlineCannotBeReleased(t *testing.T) {
+	up := tickUpstream("text/event-stream", 2, time.Millisecond)
+	defer up.Close()
+	r, _ := newRouterFor(t, up.URL, up.URL, false)
+
+	writers := map[string]func() (http.ResponseWriter, *httptest.ResponseRecorder){
+		"not supported": func() (http.ResponseWriter, *httptest.ResponseRecorder) {
+			rec := httptest.NewRecorder()
+			return rec, rec
+		},
+		"error": func() (http.ResponseWriter, *httptest.ResponseRecorder) {
+			rec := httptest.NewRecorder()
+			return deadlineErrWriter{rec}, rec
+		},
+	}
+	for name, mk := range writers {
+		t.Run(name, func(t *testing.T) {
+			w, rec := mk()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "data: 1") {
+				t.Errorf("code=%d body=%q", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestIsEventStream(t *testing.T) {
+	for ct, want := range map[string]bool{
+		"text/event-stream":                true,
+		"text/event-stream; charset=utf-8": true,
+		"Text/Event-Stream":                true,
+		"text/plain":                       false,
+		"application/json":                 false,
+		"":                                 false,
+		"text/event-stream-extra":          false,
+		"not a media type;;":               false,
+	} {
+		if got := isEventStream(ct); got != want {
+			t.Errorf("isEventStream(%q) = %v, want %v", ct, got, want)
+		}
+	}
+}
+
+// echoUpstream hijacks, answers 101 and echoes every line until the peer closes.
+func echoUpstream() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, brw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n")
+		brw.Flush()
+		for {
+			line, err := brw.ReadString('\n')
+			if err != nil {
+				return
+			}
+			brw.WriteString("echo:" + line)
+			brw.Flush()
+		}
+	}))
+}
+
+// A hijacked connection is not subject to WriteTimeout (regression guard: the
+// SSE release must not be needed, and must not be required, for Upgrade).
+func TestUpgradeOutlivesWriteTimeout(t *testing.T) {
+	up := echoUpstream()
+	defer up.Close()
+	r, _ := newRouterFor(t, up.URL, up.URL, false)
+	srv := timeoutServer(r)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprintf(c, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n", addr)
+	br := bufio.NewReader(c)
+	status, _ := br.ReadString('\n')
+	if !strings.Contains(status, "101") {
+		t.Fatalf("status = %q", status)
+	}
+	for {
+		l, err := br.ReadString('\n')
+		if err != nil || strings.TrimSpace(l) == "" {
+			break
+		}
+	}
+
+	ping := func(msg string) {
+		t.Helper()
+		fmt.Fprintf(c, "%s\n", msg)
+		got, err := br.ReadString('\n')
+		if strings.TrimSpace(got) != "echo:"+msg {
+			t.Fatalf("echo for %q = %q, err = %v", msg, got, err)
+		}
+	}
+	ping("before")
+	time.Sleep(testWriteTimeout + 200*time.Millisecond)
+	ping("after")
 }
