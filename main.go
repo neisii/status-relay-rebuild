@@ -272,6 +272,10 @@ func serve(ctx context.Context, a *app, ln net.Listener) error {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Shutdown waits for active requests, and an open SSE stream never ends on
+	// its own.  Close the streams first so Shutdown does not use up its limit.
+	srv.RegisterOnShutdown(a.router.CloseStreams)
+
 	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
