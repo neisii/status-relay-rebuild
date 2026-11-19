@@ -79,22 +79,42 @@ func (h *HealthChecker) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case t := <-ticker.C:
-			result := h.probe(t)
-			h.results <- result
+			// select picks at random when both cases are ready; make
+			// cancellation win so shutdown never starts another probe.
+			if ctx.Err() != nil {
+				return
+			}
+
+			result := h.probe(ctx, t)
+
+			// A probe aborted by shutdown is not a real failure: drop it so
+			// it reaches neither metrics nor the decision engine.  The parent
+			// ctx is checked instead of the error type so a genuine
+			// per-probe timeout (client.Timeout) is still recorded.
+			if result.Err != nil && ctx.Err() != nil {
+				return
+			}
 
 			// Record probe result to metrics
 			if h.metrics != nil {
 				success := result.Err == nil && result.StatusCode >= 200 && result.StatusCode < 500
 				h.metrics.RecordProbe(success, result.Latency)
 			}
+
+			// Never block on a full buffer past shutdown.
+			select {
+			case h.results <- result:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
 
-func (h *HealthChecker) probe(t time.Time) CheckResult {
+func (h *HealthChecker) probe(ctx context.Context, t time.Time) CheckResult {
 	start := time.Now()
 
-	req, err := http.NewRequest(http.MethodGet, h.target, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.target, nil)
 	if err != nil {
 		return CheckResult{Timestamp: t, Err: err, Latency: time.Since(start)}
 	}
