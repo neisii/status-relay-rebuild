@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -554,5 +555,196 @@ func TestServeReturnsServerError(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("serve did not return on server error")
+	}
+}
+
+// ── serve: shutdown with open streams ────────────────────────────────────
+
+// streamUpstream answers /sse with one event and then keeps the response open
+// until the client goes away.  Every other path (the health probe) answers
+// "ok" at once, or "done" after release is closed on /slow.
+func streamUpstream(t *testing.T, slowStarted chan<- struct{}, release <-chan struct{}) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sse":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: hello\n\n")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		case "/slow":
+			slowStarted <- struct{}{}
+			<-release
+			fmt.Fprint(w, "done")
+		default:
+			fmt.Fprint(w, "ok")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// startServe runs serve on a free port and returns its base URL, the cancel
+// function and the channel that receives serve's result with the time it took
+// after cancel.
+func startServe(t *testing.T, up *httptest.Server) (base string, cancel func(), done <-chan error) {
+	t.Helper()
+	a, err := newApp(fastConfig(up.URL, up.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	t.Cleanup(cancelCtx)
+	ch := make(chan error, 1)
+	go func() { ch <- serve(ctx, a, ln) }()
+	return "http://" + ln.Addr().String(), cancelCtx, ch
+}
+
+// openSSEClient reads /sse from base until the first event, then reports how
+// the stream ends.
+func openSSEClient(t *testing.T, base string) <-chan error {
+	t.Helper()
+	var resp *http.Response
+	eventually(t, "proxy serves /sse", func() bool {
+		r, err := http.Get(base + "/sse")
+		if err != nil {
+			return false
+		}
+		resp = r
+		return true
+	})
+	t.Cleanup(func() { resp.Body.Close() })
+	br := bufio.NewReader(resp.Body)
+	if line, err := br.ReadString('\n'); err != nil || !strings.HasPrefix(line, "data:") {
+		t.Fatalf("first event: %q, %v", line, err)
+	}
+	end := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, br)
+		end <- err
+	}()
+	return end
+}
+
+// An open SSE stream must not make shutdown use up the 5 second limit, and the
+// client must see a clean end of stream.
+func TestServeShutdownEndsOpenSSE(t *testing.T) {
+	quietLog(t)
+	up := streamUpstream(t, nil, nil)
+	base, cancel, done := startServe(t, up)
+	end := openSSEClient(t, base)
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serve returned %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not return after ctx cancel")
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("shutdown took %v with an open SSE stream, want well under the 5s limit", took)
+	}
+	select {
+	case err := <-end:
+		if err != nil {
+			t.Errorf("client saw %v, want a clean end of stream", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client stream did not end")
+	}
+}
+
+// A plain response that is still in progress is waited for, not cut.
+func TestServeShutdownWaitsForPlainResponse(t *testing.T) {
+	quietLog(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	up := streamUpstream(t, started, release)
+	base, cancel, done := startServe(t, up)
+
+	body := make(chan string, 1)
+	go func() {
+		var resp *http.Response
+		var err error
+		for i := 0; i < 500; i++ {
+			if resp, err = http.Get(base + "/slow"); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil {
+			body <- "error: " + err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		body <- fmt.Sprintf("%s|%v", b, err)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow request did not reach upstream")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned (%v) while a response was in progress", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	if got := <-body; got != "done|<nil>" {
+		t.Errorf("response = %q, want it delivered in full", got)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serve returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the response finished")
+	}
+}
+
+// The exit code stays 0 with an open stream.
+func TestRunGracefulStopWithOpenSSE(t *testing.T) {
+	quietLog(t)
+	up := streamUpstream(t, nil, nil)
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	code := make(chan int, 1)
+	go func() {
+		code <- run(ctx, []string{"start", "--primary", up.URL, "--fallback", up.URL,
+			"--port", fmt.Sprint(port)}, io.Discard)
+	}()
+	end := openSSEClient(t, fmt.Sprintf("http://127.0.0.1:%d", port))
+
+	cancel()
+	select {
+	case c := <-code:
+		if c != 0 {
+			t.Errorf("exit = %d, want 0", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after ctx cancel")
+	}
+	select {
+	case <-end:
+	case <-time.After(2 * time.Second):
+		t.Error("client stream did not end")
 	}
 }

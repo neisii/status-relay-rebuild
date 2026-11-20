@@ -572,3 +572,183 @@ func TestUpgradeOutlivesWriteTimeout(t *testing.T) {
 	time.Sleep(testWriteTimeout + 200*time.Millisecond)
 	ping("after")
 }
+
+// ── CloseStreams (graceful shutdown) ─────────────────────────────────────
+
+// openStream sends one event and then keeps the response open until the
+// client or the proxy goes away.
+func openStream(contentType string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		fmt.Fprint(w, "data: hello\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+}
+
+// streamResult is how a client read of an open stream ended.
+type streamResult struct {
+	events int
+	err    error // io.EOF on a clean end
+}
+
+// watchStream GETs url, waits for the first event and returns a channel that
+// delivers how the stream ended.
+func watchStream(t *testing.T, url string) <-chan streamResult {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	br := bufio.NewReader(resp.Body)
+	if line, err := br.ReadString('\n'); err != nil || !strings.HasPrefix(line, "data:") {
+		t.Fatalf("first event: %q, %v", line, err)
+	}
+	br.ReadString('\n') // blank line that ends the event
+	out := make(chan streamResult, 1)
+	go func() {
+		n := 1
+		for {
+			line, err := br.ReadString('\n')
+			if strings.HasPrefix(line, "data:") {
+				n++
+			}
+			if err != nil {
+				out <- streamResult{n, err}
+				return
+			}
+		}
+	}()
+	return out
+}
+
+func waitStream(t *testing.T, ch <-chan streamResult) streamResult {
+	t.Helper()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not end after CloseStreams")
+		return streamResult{}
+	}
+}
+
+func TestCloseStreamsEndsOpenSSECleanly(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallback=%v", fallback), func(t *testing.T) {
+			up := openStream("text/event-stream")
+			t.Cleanup(up.Close)
+			r, m := newRouterFor(t, up.URL, up.URL, fallback)
+			srv := httptest.NewServer(r)
+			t.Cleanup(srv.Close)
+
+			ended := watchStream(t, srv.URL)
+			r.CloseStreams()
+			res := waitStream(t, ended)
+			if res.err != io.EOF || res.events != 1 {
+				t.Errorf("stream ended with %d events, err = %v; want 1 event and io.EOF", res.events, res.err)
+			}
+
+			// The final chunk is written after ServeHTTP returns, so the
+			// request is already recorded when the client sees the end.
+			target := map[bool]string{false: "primary", true: "fallback"}[fallback]
+			st := m.Snapshot()["request_stats"].(map[string]interface{})[target].(map[string]interface{})
+			if st["total_requests"] != 1 || st["successful_requests"] != 1 || st["failed_requests"] != 0 {
+				t.Errorf("%s stats = %v", target, st)
+			}
+		})
+	}
+}
+
+func TestCloseStreamsEndsEveryOpenSSE(t *testing.T) {
+	up := openStream("text/event-stream")
+	t.Cleanup(up.Close)
+	r, _ := newRouterFor(t, up.URL, up.URL, false)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	var all []<-chan streamResult
+	for i := 0; i < 3; i++ {
+		all = append(all, watchStream(t, srv.URL))
+	}
+	r.CloseStreams()
+	for i, ch := range all {
+		if res := waitStream(t, ch); res.err != io.EOF {
+			t.Errorf("stream %d ended with err = %v, want io.EOF", i, res.err)
+		}
+	}
+}
+
+// A stream that starts while shutdown is already under way (accepted just
+// before the listener closed) must end too, not stay open.
+func TestSSEStartedAfterCloseStreamsEnds(t *testing.T) {
+	up := openStream("text/event-stream")
+	t.Cleanup(up.Close)
+	r, _ := newRouterFor(t, up.URL, up.URL, false)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	r.CloseStreams()
+	done := make(chan error, 1)
+	go func() {
+		_, err := readEvents(srv.URL)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Errorf("late stream ended with err = %v, want io.EOF", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream started after CloseStreams stayed open")
+	}
+}
+
+// CloseStreams only touches SSE: a response that is still being written
+// finishes, because Shutdown waits for it.
+func TestCloseStreamsLeavesOtherResponsesAlone(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, "first,")
+		w.(http.Flusher).Flush()
+		close(started)
+		<-release
+		io.WriteString(w, "second")
+	}))
+	t.Cleanup(up.Close)
+	r, _ := newRouterFor(t, up.URL, up.URL, false)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	got := make(chan string, 1)
+	go func() {
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			got <- "error: " + err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		got <- fmt.Sprintf("%s|%v", b, err)
+	}()
+	<-started
+	r.CloseStreams()
+	close(release)
+	select {
+	case s := <-got:
+		if s != "first,second|<nil>" {
+			t.Errorf("plain response = %q, want it complete", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("plain response did not finish")
+	}
+}
+
+func TestCloseStreamsIsIdempotent(t *testing.T) {
+	r, _ := newRouterFor(t, "http://127.0.0.1:1", "http://127.0.0.1:1", false)
+	r.CloseStreams()
+	r.CloseStreams()
+}

@@ -8,11 +8,13 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"log"
 	"mime"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/neisii/status-relay/internal/engine"
@@ -25,6 +27,10 @@ type Router struct {
 	fallbackProxy *httputil.ReverseProxy
 	engine        *engine.DecisionEngine
 	metrics       *metrics.Metrics
+
+	// closing is closed by CloseStreams; open SSE responses end when it is.
+	closing   chan struct{}
+	closeOnce sync.Once
 }
 
 // New creates a Router.  primaryURL and fallbackURL must be valid absolute URLs.
@@ -42,7 +48,17 @@ func New(primaryURL, fallbackURL string, eng *engine.DecisionEngine) (*Router, e
 		primaryProxy:  newReverseProxy(primary),
 		fallbackProxy: newReverseProxy(fallback),
 		engine:        eng,
+		closing:       make(chan struct{}),
 	}, nil
+}
+
+// CloseStreams ends every open SSE response with a clean end of stream and
+// does the same for SSE responses that start afterwards.  Other responses are
+// not touched.  It is meant for http.Server.RegisterOnShutdown: Shutdown waits
+// for active requests, and an SSE stream would otherwise keep it waiting until
+// its timeout.  It is safe to call more than once.
+func (r *Router) CloseStreams() {
+	r.closeOnce.Do(func() { close(r.closing) })
 }
 
 // SetMetrics attaches a Metrics instance to record request statistics.
@@ -62,7 +78,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// ModifyResponse only sees the *http.Response; hand it the controller of
 	// this request's writer through the context (see releaseWriteDeadlineForSSE).
 	rc := http.NewResponseController(wrapped)
-	req = req.WithContext(context.WithValue(req.Context(), responseControllerKey{}, rc))
+	ctx := context.WithValue(req.Context(), responseControllerKey{}, rc)
+	ctx = context.WithValue(ctx, streamsClosingKey{}, r.closing)
+	req = req.WithContext(ctx)
 
 	switch target {
 	case engine.Primary:
@@ -113,7 +131,11 @@ func newReverseProxy(base *url.URL) *httputil.ReverseProxy {
 		req.Host = base.Host // make sure Host matches the upstream
 	}
 
-	proxy.ModifyResponse = releaseWriteDeadlineForSSE
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		releaseWriteDeadlineForSSE(resp)
+		endSSEOnClose(resp)
+		return nil
+	}
 
 	// Log upstream errors without crashing the proxy.
 	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
@@ -155,4 +177,61 @@ func releaseWriteDeadlineForSSE(resp *http.Response) error {
 func isEventStream(contentType string) bool {
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	return err == nil && mediaType == "text/event-stream"
+}
+
+// streamsClosingKey is the request-context key under which Router.ServeHTTP
+// stores the channel that CloseStreams closes.
+type streamsClosingKey struct{}
+
+// endSSEOnClose makes an SSE response body end with io.EOF once the Router's
+// closing channel is closed, so ReverseProxy finishes the response normally
+// (the client sees a clean end, not a truncated chunked stream).  Cancelling
+// the request context instead would make ReverseProxy abort the handler.  A
+// response outside Router, or one that is not SSE, is left as it is.
+func endSSEOnClose(resp *http.Response) {
+	if resp.Request == nil || !isEventStream(resp.Header.Get("Content-Type")) {
+		return
+	}
+	closing, ok := resp.Request.Context().Value(streamsClosingKey{}).(chan struct{})
+	if !ok {
+		return
+	}
+	resp.Body = newEOFOnClose(resp.Body, closing)
+}
+
+// eofOnClose reports io.EOF instead of a read error after closing is closed.
+type eofOnClose struct {
+	io.ReadCloser
+	closing <-chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func newEOFOnClose(body io.ReadCloser, closing <-chan struct{}) *eofOnClose {
+	e := &eofOnClose{ReadCloser: body, closing: closing, done: make(chan struct{})}
+	go func() {
+		select {
+		case <-closing:
+			body.Close() // unblocks a Read waiting for the next event
+		case <-e.done:
+		}
+	}()
+	return e
+}
+
+func (e *eofOnClose) Read(p []byte) (int, error) {
+	n, err := e.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		select {
+		case <-e.closing:
+			err = io.EOF
+		default:
+		}
+	}
+	return n, err
+}
+
+func (e *eofOnClose) Close() error {
+	e.once.Do(func() { close(e.done) })
+	return e.ReadCloser.Close()
 }
